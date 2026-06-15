@@ -1,5 +1,6 @@
 // Package echr is the library behind the echr command line:
-// the HTTP client, request shaping, and the typed data models for echr.
+// the HTTP client, request shaping, and the typed data models for the ECHR
+// HUDOC database of 229k+ case judgments and decisions.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
@@ -9,27 +10,81 @@ package echr
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to echr. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "echr/dev (+https://github.com/tamnd/echr-cli)"
-
 // Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at echr.com; change it once you
-// know the real endpoints you want to read.
-const Host = "echr.com"
+// domain.go claims.
+const Host = "hudoc.echr.coe.int"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://hudoc.echr.coe.int/app/query/results"
 
-// Client talks to echr over HTTP.
+// DefaultUserAgent identifies the client to HUDOC. A real, honest
+// User-Agent is both polite and the thing most likely to keep you unblocked.
+const DefaultUserAgent = "echr-cli/0.1.0"
+
+const selectFields = "itemid,docname,judgementdate,decisiondate,appno,respondent,importance,typedescription,documentcollectionid"
+
+// Wire types — match the HUDOC JSON shapes exactly. Unexported.
+
+type wireColumns struct {
+	ItemID        string `json:"itemid"`
+	DocName       string `json:"docname"`
+	JudgementDate string `json:"judgementdate"` // note: "judgement" spelling
+	DecisionDate  string `json:"decisiondate"`
+	AppNo         string `json:"appno"`
+	Respondent    string `json:"respondent"`
+	Importance    string `json:"importance"`
+	TypeDesc      string `json:"typedescription"`
+	CollectionID  string `json:"documentcollectionid"`
+}
+
+type wireResult struct {
+	Columns wireColumns `json:"columns"`
+}
+
+type wireResp struct {
+	ResultCount int          `json:"resultcount"`
+	Results     []wireResult `json:"results"`
+}
+
+// Case is the public record type: one ECHR case from HUDOC.
+type Case struct {
+	ID           string `json:"id"            kit:"id"` // itemid
+	DocName      string `json:"doc_name"`
+	JudgmentDate string `json:"judgment_date"`
+	DecisionDate string `json:"decision_date"`
+	AppNo        string `json:"app_no"`
+	Respondent   string `json:"respondent"`
+	Importance   string `json:"importance"`
+	Type         string `json:"type"`
+	Collection   string `json:"collection"`
+}
+
+func caseFromWire(r wireResult) *Case {
+	c := r.Columns
+	return &Case{
+		ID:           c.ItemID,
+		DocName:      c.DocName,
+		JudgmentDate: c.JudgementDate,
+		DecisionDate: c.DecisionDate,
+		AppNo:        c.AppNo,
+		Respondent:   c.Respondent,
+		Importance:   c.Importance,
+		Type:         c.TypeDesc,
+		Collection:   c.CollectionID,
+	}
+}
+
+// Client talks to HUDOC over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,21 +95,90 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 500ms
+// minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
 		HTTP:      &http.Client{Timeout: 30 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// SearchCases queries HUDOC and returns matching cases plus the total count.
+func (c *Client) SearchCases(ctx context.Context, query, country string, importance, limit, offset int) ([]Case, int, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := c.buildURL(buildQuery(query, country, importance), limit, offset)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, 0, err
+	}
+	return parseResp(body)
+}
+
+// GetCase fetches a single case by HUDOC item ID (e.g. "001-248971").
+func (c *Client) GetCase(ctx context.Context, itemID string) (*Case, error) {
+	q := "itemid:" + url.QueryEscape(itemID)
+	u := c.buildURL(q, 1, 0)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	cases, _, err := parseResp(body)
+	if err != nil {
+		return nil, err
+	}
+	if len(cases) == 0 {
+		return nil, fmt.Errorf("case %s: not found", itemID)
+	}
+	return &cases[0], nil
+}
+
+// RecentCases lists recently decided cases sorted by judgment date descending.
+func (c *Client) RecentCases(ctx context.Context, limit int) ([]Case, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	u := c.buildURL("contentsitename:ECHR", limit, 0)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	cases, _, err := parseResp(body)
+	return cases, err
+}
+
+// buildQuery assembles a HUDOC query string from the optional filters.
+func buildQuery(query, country string, importance int) string {
+	q := "contentsitename:ECHR"
+	if country != "" {
+		q += " AND respondent:" + strings.ToUpper(country)
+	}
+	if importance > 0 {
+		q += " AND importance:" + strconv.Itoa(importance)
+	}
+	if query != "" {
+		q += " AND " + query
+	}
+	return q
+}
+
+// buildURL assembles the full HUDOC URL with all standard params.
+func (c *Client) buildURL(query string, limit, offset int) string {
+	return BaseURL +
+		"?query=" + url.QueryEscape(query) +
+		"&select=" + url.QueryEscape(selectFields) +
+		"&sort=" + url.QueryEscape("judgementdate Desc") +
+		"&start=" + strconv.Itoa(offset) +
+		"&length=" + strconv.Itoa(limit) +
+		"&rankingModelId=11111111-0000-0000-0000-000000000000"
+}
+
+// get fetches a URL and returns the response body, with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +188,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +197,17 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -123,78 +248,15 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on echr.com. It is a stand-in for the typed records you
-// will model from the real echr endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `echr cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
+// parseResp decodes a raw HUDOC JSON response into cases + total count.
+func parseResp(body []byte) ([]Case, int, error) {
+	var resp wireResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, 0, fmt.Errorf("decode response: %w", err)
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
+	cases := make([]Case, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		cases = append(cases, *caseFromWire(r))
 	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	return cases, resp.ResultCount, nil
 }

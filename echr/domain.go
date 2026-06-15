@@ -2,7 +2,8 @@ package echr
 
 import (
 	"context"
-	"net/url"
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -19,9 +20,6 @@ import (
 // echr:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone echr binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the echr driver. It carries no state; the per-run client is
@@ -36,40 +34,38 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "echr",
-			Short:  "A command line for echr.",
-			Long: `A command line for echr.
+			Short:  "A command line for the European Court of Human Rights HUDOC database.",
+			Long: `A command line for the ECHR HUDOC database.
 
-echr reads public echr data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+echr reads 229k+ public case judgments and decisions from the European Court of
+Human Rights over plain HTTPS, shapes them into clean records, and prints output
+that pipes into the rest of your tools. No API key, nothing to run alongside it.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/echr-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `echr page` and
-	// `ant get echr://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search HUDOC by text or query",
+		Args:    []kit.Arg{{Name: "query", Help: "search text or HUDOC query"}}}, searchCases)
 
-	// List op: members of a page, the home of `echr links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// echr://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{Name: "case", Group: "read", Single: true,
+		Summary: "Get a single case by HUDOC item ID", URIType: "case", Resolver: true,
+		Args: []kit.Arg{{Name: "item-id", Help: "HUDOC item ID (e.g. 001-248971)"}}}, getCase)
+
+	kit.Handle(app, kit.OpMeta{Name: "recent", Group: "read", List: true,
+		Summary: "List recently decided cases"}, recentCases)
+
+	kit.Handle(app, kit.OpMeta{Name: "keycases", Group: "read", List: true,
+		Summary: "List key cases (Grand Chamber, importance level 1)"}, keyCases)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,40 +84,87 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query      string  `kit:"arg"          help:"search text or HUDOC query"`
+	Country    string  `kit:"flag"         help:"filter by respondent country code (e.g. FRA)"`
+	Importance int     `kit:"flag"         help:"filter by importance level (1-4)"`
+	Limit      int     `kit:"flag,inherit" help:"max results"`
+	Offset     int     `kit:"flag"         help:"result offset"`
+	Client     *Client `kit:"inject"`
+}
+
+type caseInput struct {
+	ItemID string  `kit:"arg"   help:"HUDOC item ID (e.g. 001-248971)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type recentInput struct {
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
-	}
-	return emit(p)
+type keycasesInput struct {
+	Country string  `kit:"flag"         help:"filter by respondent country code (e.g. FRA)"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Client  *Client `kit:"inject"`
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+// --- handlers ---
+
+func searchCases(ctx context.Context, in searchInput, emit func(*Case) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	cases, _, err := in.Client.SearchCases(ctx, in.Query, in.Country, in.Importance, limit, in.Offset)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range cases {
+		if err := emit(&cases[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func getCase(ctx context.Context, in caseInput, emit func(*Case) error) error {
+	c, err := in.Client.GetCase(ctx, in.ItemID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(c)
+}
+
+func recentCases(ctx context.Context, in recentInput, emit func(*Case) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	cases, err := in.Client.RecentCases(ctx, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range cases {
+		if err := emit(&cases[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func keyCases(ctx context.Context, in keycasesInput, emit func(*Case) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	cases, _, err := in.Client.SearchCases(ctx, "", in.Country, 1, limit, 0)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range cases {
+		if err := emit(&cases[i]); err != nil {
 			return err
 		}
 	}
@@ -130,44 +173,28 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 
 // --- Resolver: the URI-native string functions, pure and network-free ---
 
-// Classify turns any accepted input — a bare path or a full echr.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// itemIDRE matches HUDOC item IDs like "001-248971".
+var itemIDRE = regexp.MustCompile(`^\d{3}-\d+$`)
+
+// Classify turns any accepted input into the canonical (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized echr reference: %q", input)
+	s := strings.TrimSpace(input)
+	if s == "" {
+		return "", "", errs.Usage("HUDOC item ID required")
 	}
-	return "page", id, nil
+	return "case", s, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	if uriType != "case" {
 		return "", errs.Usage("echr has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
+	return fmt.Sprintf(`https://hudoc.echr.coe.int/eng#{"itemid":["%s"]}`, id), nil
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
