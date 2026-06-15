@@ -1,0 +1,10 @@
+title       = "echr"
+baseURL     = "https://echr-cli.tamnd.com/"
+description = "A command line for echr."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/echr-cli"
